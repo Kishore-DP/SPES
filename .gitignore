@@ -1,0 +1,17 @@
+# Secrets — never commit these
+key.txt
+.env
+
+# Personal conversation memory
+spes_memory.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime temp files (auto-regenerated)
+capture.jpg
+question.wav
+reply.mp3
+*.log
+server_log.txt
