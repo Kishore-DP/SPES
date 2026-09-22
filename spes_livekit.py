@@ -18,12 +18,14 @@
 # Run it (talk using your laptop mic/speakers):
 #   python spes_livekit.py console
 
+import asyncio
+
 from dotenv import load_dotenv
 load_dotenv()   # loads keys from .env
 
 from livekit import agents
 from livekit.agents import (AgentSession, Agent, WorkerOptions, cli,
-                            inference, StopResponse)
+                            inference, StopResponse, function_tool, RunContext)
 from livekit.plugins import google, silero
 
 # reuse everything we already built and tested
@@ -50,7 +52,10 @@ class Max(Agent):
             "user (part of a device called SPES). Answer briefly and clearly "
             "in a natural spoken style, usually one to three sentences. "
             "When the user wakes you, greet them in one short sentence. "
-            "When they tell you to go to sleep, say a short goodbye."
+            "When they tell you to go to sleep, say a short goodbye. "
+            "When the user asks you to READ something in front of them "
+            "(e.g. 'read this', 'what does this say', 'read the page'), call the "
+            "read_text tool, then read the returned text aloud clearly."
         )
         # Inject what Max remembers from past chats into the system prompt.
         context = memory.build_context(mem)
@@ -61,6 +66,21 @@ class Max(Agent):
         self.mem = mem
         self.awake = False       # start asleep
         self.last_answer = ""    # for the REPEAT command
+
+    @function_tool
+    async def read_text(self, context: RunContext) -> str:
+        """Capture a photo from the SPES camera and read any text found in it.
+        Call this whenever the user asks to read something in front of them,
+        e.g. 'read this', 'what does this say', 'read the page'."""
+        print("  >>> READ tool: capturing from camera + OCR...")
+        try:
+            # Runs the blocking capture + Gemini OCR off the event loop.
+            text = await asyncio.to_thread(spes.read_camera_image)
+        except Exception as e:
+            print("  read error:", e)
+            return "Sorry, I could not read the image right now."
+        print("  read ->", text[:80])
+        return f"The text reads: {text}"
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
         text = new_message.text_content or ""
