@@ -15,6 +15,7 @@ from flask import Flask, request, send_file, Response
 from google import genai
 from google.genai import types
 import edge_tts
+import miniaudio
 
 # --- Load API key + connect to Gemini ---
 with open("key.txt") as f:
@@ -167,6 +168,106 @@ def ask_voice():
         answer = NO_SPEECH_MSG
     print("[/ask] ->", answer[:80].replace("\n", " "), "...")
     return audio_reply(answer, request.form.get("voice", "Aria"))
+
+
+# ---------- PCM endpoints for the ESP32-WROOM brain (Bluetooth A2DP out) ----------
+# The ESP32 brain downloads the whole answer (WiFi), then plays it over
+# Bluetooth (they can't run at once). We send 8kHz MONO to keep the buffer
+# small enough for the WROOM's limited RAM (~129KB free); the ESP32 upsamples
+# it to 44.1kHz stereo for the earbuds. 8kHz = telephone quality, fine for speech.
+PCM_RATE = 8000
+
+
+def text_to_pcm(text, voice="Aria"):
+    """TTS the text, then decode the mp3 to raw 44100 Hz 16-bit MONO PCM bytes."""
+    text_to_mp3(text, voice, "reply.mp3")
+    data = open("reply.mp3", "rb").read()
+    dec = miniaudio.decode(data, output_format=miniaudio.SampleFormat.SIGNED16,
+                           nchannels=1, sample_rate=PCM_RATE)
+    return bytes(dec.samples)
+
+
+def pcm_response(text, voice="Aria"):
+    pcm = text_to_pcm(text, voice)
+    resp = Response(pcm, mimetype="application/octet-stream")
+    resp.headers["X-SPES-Text"] = urllib.parse.quote(text)
+    return resp
+
+
+@app.route("/say")
+def say_pcm():
+    """GET /say?text=...  -> 44100 Hz mono PCM of that text. For testing the
+    ESP32 A2DP playback without the mic."""
+    text = (request.args.get("text") or "Hello from SPES").strip()
+    print("[/say]", text[:60])
+    return pcm_response(text, request.args.get("voice", "Aria"))
+
+
+@app.route("/ask_pcm", methods=["POST"])
+def ask_pcm():
+    """Voice question in (raw WAV body) -> spoken answer as 44100 Hz mono PCM.
+    Same as /ask but returns PCM the ESP32 can stream straight to the earbuds."""
+    if "audio" in request.files:
+        audio_bytes = request.files["audio"].read()
+        fname = request.files["audio"].filename or "audio.wav"
+    else:
+        audio_bytes = request.data
+        fname = "audio.wav"
+    if not audio_bytes:
+        return Response("No audio received", status=400)
+
+    mime = "audio/wav" if fname.lower().endswith(".wav") else "audio/mp3"
+    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime)
+    prompt = (
+        "The audio contains a spoken question from a visually impaired user. "
+        "If the audio has NO clear speech (silence or noise only), do NOT invent "
+        "a question; reply exactly with: " + NO_SPEECH_MSG + "\n"
+        "Otherwise answer clearly and briefly in 1-3 spoken sentences. "
+        "Return ONLY the answer text."
+    )
+    answer = gemini([prompt, audio_part]) or NO_SPEECH_MSG
+    print("[/ask_pcm] ->", answer[:80].replace("\n", " "), "...")
+    return pcm_response(answer, request.form.get("voice", "Aria"))
+
+
+# ---------- /brain: full SPES driven by the ESP32-WROOM's INMP441 mic ----------
+# The brain records voice and POSTs the raw WAV here. We reuse combined_spes to
+# decide READ vs ASK, do the camera OCR / AI answer, and PLAY it on THIS laptop
+# (so the audio comes out of the laptop's speakers / paired earbuds).
+import combined_spes as cspes
+
+
+@app.route("/brain", methods=["POST"])
+def brain():
+    if "audio" in request.files:
+        audio_bytes = request.files["audio"].read()
+    else:
+        audio_bytes = request.data
+    if not audio_bytes:
+        return Response("No audio received", status=400)
+
+    # Hand the audio to combined_spes' classifier (it reads QUESTION_WAV).
+    with open(cspes.QUESTION_WAV, "wb") as f:
+        f.write(audio_bytes)
+    try:
+        mode, heard, answer = cspes.classify_and_answer()
+    except Exception as e:
+        print("[/brain] classify error:", e)
+        return Response("error", status=500)
+
+    print("[/brain] heard:", heard, "| mode:", mode)
+    if mode == "READ":
+        text = cspes.read_camera_image()      # pulls from ESP32-CAM + OCR
+        spoken = "Here is what I can read. " + text
+    else:
+        spoken = answer or NO_SPEECH_MSG
+
+    print("[/brain] speaking:", spoken[:80])
+    cspes.speak(spoken)                        # plays on the LAPTOP
+
+    resp = Response("OK", status=200)
+    resp.headers["X-SPES-Text"] = urllib.parse.quote(spoken)
+    return resp
 
 
 if __name__ == "__main__":
