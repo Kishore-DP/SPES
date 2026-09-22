@@ -10,6 +10,7 @@ import logging
 import time
 import wave
 import numpy as np
+import requests
 import sounddevice as sd
 import cv2
 from google import genai
@@ -29,9 +30,14 @@ QUESTION_WAV = "question.wav"
 SILENCE_THRESHOLD = 60
 NO_SPEECH_MSG = "Sorry, I could not catch that. Please try again."
 
-# For now we use the LAPTOP webcam as the camera.
-# LATER: the ESP32-CAM photo will replace this capture step.
 CAMERA_IMAGE = "capture.jpg"
+
+# --- Camera source ---
+# If ESP32_CAM_URL is set, SPES grabs the photo from the ESP32-CAM over WiFi
+# (its CameraWebServer /capture endpoint). If left empty, it falls back to the
+# laptop webcam with a live preview. Set this to the CAM's IP once it joins your
+# home WiFi in STA mode, e.g. "http://192.168.29.57/capture".
+ESP32_CAM_URL = "http://192.168.29.138/capture"
 
 with open("key.txt") as f:
     API_KEY = f.read().strip()
@@ -152,10 +158,31 @@ def capture_from_webcam():
     return True
 
 
+def capture_from_esp32():
+    """Grab a single JPEG frame from the ESP32-CAM over WiFi (its CameraWebServer
+    /capture endpoint) and save it to CAMERA_IMAGE. Returns True on success."""
+    print(f"Fetching photo from ESP32-CAM: {ESP32_CAM_URL}")
+    try:
+        r = requests.get(ESP32_CAM_URL, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        print("  ESP32-CAM error:", e)
+        return False
+    with open(CAMERA_IMAGE, "wb") as f:
+        f.write(r.content)
+    print(f"Photo received ({len(r.content)} bytes).")
+    return True
+
+
 def read_camera_image():
-    """Show preview, capture on SPACE, then OCR the photo."""
-    if not capture_from_webcam():
-        return "Capture cancelled. Nothing to read."
+    """Get a photo (ESP32-CAM over WiFi if configured, else laptop webcam),
+    then OCR it."""
+    if ESP32_CAM_URL:
+        got = capture_from_esp32()
+    else:
+        got = capture_from_webcam()
+    if not got:
+        return "Could not get an image to read."
     with open(CAMERA_IMAGE, "rb") as f:
         img_bytes = f.read()
     img_part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
