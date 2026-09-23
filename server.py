@@ -234,8 +234,11 @@ def ask_pcm():
 # The brain records voice and POSTs the raw WAV here. The laptop decides
 # READ / ASK / CONTROL, uses conversation memory, does the camera OCR / AI
 # answer, and PLAYS it on THIS laptop (out its speakers / paired earbuds).
+import requests
 import combined_spes as cspes
 import spes_memory as memory
+import spes_navigation as nav
+import spes_sos as sos
 from playsound3 import playsound
 
 # --- brain state (single user) ---
@@ -264,27 +267,44 @@ def classify_brain(audio_bytes, context=""):
         memblock +
         "The audio is a spoken command to SPES, a reading aid + assistant for a "
         "visually impaired user. Reply in EXACTLY this format, nothing else:\n"
-        "MODE: READ or ASK or CONTROL\n"
+        "MODE: READ or ASK or CONTROL or NAVIGATE or SOS\n"
         "COMMAND: <if MODE is CONTROL, one of STOP, REPEAT, FORGET, LOUDER, "
         "SOFTER; otherwise blank>\n"
+        "DESTINATION: <if MODE is NAVIGATE, the place the user wants to go to; "
+        "otherwise blank>\n"
         "HEARD: <exactly what the user said>\n"
         "ANSWER: <if MODE is ASK, a brief 1-3 sentence spoken answer using the "
         "memory above where relevant; otherwise blank>\n\n"
         "MODE READ = the user wants to read/see text in front of them "
         "('read this', 'what does this say', 'read the page').\n"
+        "MODE NAVIGATE = the user wants directions to a place ('navigate to', "
+        "'take me to', 'directions to', 'how do I get to').\n"
+        "MODE SOS = the user is in danger or needs emergency help ('SOS', "
+        "'emergency', 'help me', 'I am in danger', 'call for help').\n"
         "MODE CONTROL = commanding the device itself: STOP (stop/quiet/cancel), "
         "REPEAT (say again), FORGET (clear memory), LOUDER, SOFTER.\n"
         "MODE ASK = a general question for information."
     )
     reply = gemini([prompt, audio_part])
 
-    mode, command, heard, answer = "ASK", "", "", ""
+    mode, command, destination, heard, answer = "ASK", "", "", "", ""
     for line in reply.splitlines():
         u = line.upper()
         if u.startswith("MODE:"):
-            mode = "READ" if "READ" in u else ("CONTROL" if "CONTROL" in u else "ASK")
+            if "READ" in u:
+                mode = "READ"
+            elif "NAVIGATE" in u:
+                mode = "NAVIGATE"
+            elif "SOS" in u:
+                mode = "SOS"
+            elif "CONTROL" in u:
+                mode = "CONTROL"
+            else:
+                mode = "ASK"
         elif u.startswith("COMMAND:"):
             command = line.split(":", 1)[1].strip().upper()
+        elif u.startswith("DESTINATION:"):
+            destination = line.split(":", 1)[1].strip()
         elif u.startswith("HEARD:"):
             heard = line.split(":", 1)[1].strip()
         elif u.startswith("ANSWER:"):
@@ -296,7 +316,11 @@ def classify_brain(audio_bytes, context=""):
         if any(p in low for p in phrases):
             mode, command = "CONTROL", cmd
             break
-    return mode, command, heard, answer
+    # Local backup for SOS (safety: err toward triggering).
+    if any(p in low for p in ["sos", "emergency", "help me",
+                              "in danger", "call for help", "save me"]):
+        mode = "SOS"
+    return mode, command, destination, heard, answer
 
 
 def handle_brain_control(command):
@@ -346,16 +370,39 @@ def brain():
 
     context = memory.build_context(_brain_mem)
     try:
-        mode, command, heard, answer = classify_brain(audio_bytes, context)
+        mode, command, destination, heard, answer = classify_brain(audio_bytes, context)
     except Exception as e:
         print("[/brain] classify error:", e)
         return Response("error", status=500)
-    print("[/brain] heard:", heard, "| mode:", mode, command)
+    print("[/brain] heard:", heard, "| mode:", mode, command, destination)
 
     if mode == "CONTROL":
         spoken = handle_brain_control(command)
         speak_local(spoken)
         # control acks aren't stored as conversation turns
+
+    elif mode == "NAVIGATE":
+        try:
+            spoken = nav.navigate(destination)
+        except Exception as e:
+            print("[/brain] nav error:", e)
+            spoken = "Sorry, navigation is not available right now."
+        speak_local(spoken)
+        _brain_last_answer = spoken
+        memory.remember_turn(_brain_mem, heard or ("navigate to " + destination),
+                             "Gave directions to " + destination, client, MODELS)
+
+    elif mode == "SOS":
+        # Grab a photo from the camera as evidence (best effort), then alert.
+        photo = None
+        try:
+            if cspes.ESP32_CAM_URL:
+                photo = requests.get(cspes.ESP32_CAM_URL, timeout=10).content
+        except Exception as e:
+            print("[/brain] SOS photo error:", e)
+        spoken, _maps = sos.send_sos(photo)
+        speak_local(spoken)
+        # SOS is not stored as a normal conversation turn
 
     elif mode == "READ":
         text = cspes.read_camera_image()          # pulls from ESP32-CAM + OCR
