@@ -231,14 +231,112 @@ def ask_pcm():
 
 
 # ---------- /brain: full SPES driven by the ESP32-WROOM's INMP441 mic ----------
-# The brain records voice and POSTs the raw WAV here. We reuse combined_spes to
-# decide READ vs ASK, do the camera OCR / AI answer, and PLAY it on THIS laptop
-# (so the audio comes out of the laptop's speakers / paired earbuds).
+# The brain records voice and POSTs the raw WAV here. The laptop decides
+# READ / ASK / CONTROL, uses conversation memory, does the camera OCR / AI
+# answer, and PLAYS it on THIS laptop (out its speakers / paired earbuds).
 import combined_spes as cspes
+import spes_memory as memory
+from playsound3 import playsound
+
+# --- brain state (single user) ---
+BRAIN_VOLUME_STEPS = ["-50%", "-25%", "+0%", "+25%", "+50%", "+100%"]
+_brain_volume_idx = 2                       # start at +0%
+_brain_last_answer = ""                      # for the REPEAT command
+_brain_mem = memory.load_mem()               # persistent conversation memory
+
+# Local keyword backup so obvious control phrases never get misrouted.
+CONTROL_MAP = [
+    ("STOP",   ["stop listening", "stop now", "be quiet", "never mind", "cancel that"]),
+    ("REPEAT", ["say that again", "repeat that", "repeat", "what did you say"]),
+    ("FORGET", ["forget everything", "clear your memory", "clear memory",
+                "forget me", "wipe your memory"]),
+    ("LOUDER", ["speak louder", "louder", "volume up", "turn it up"]),
+    ("SOFTER", ["speak softer", "speak quieter", "quieter", "volume down", "turn it down"]),
+]
+
+
+def classify_brain(audio_bytes, context=""):
+    """Decide READ / ASK / CONTROL from the spoken audio, using memory context
+    for ASK answers. Returns (mode, command, heard, answer)."""
+    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+    memblock = (context + "\n\n") if context else ""
+    prompt = (
+        memblock +
+        "The audio is a spoken command to SPES, a reading aid + assistant for a "
+        "visually impaired user. Reply in EXACTLY this format, nothing else:\n"
+        "MODE: READ or ASK or CONTROL\n"
+        "COMMAND: <if MODE is CONTROL, one of STOP, REPEAT, FORGET, LOUDER, "
+        "SOFTER; otherwise blank>\n"
+        "HEARD: <exactly what the user said>\n"
+        "ANSWER: <if MODE is ASK, a brief 1-3 sentence spoken answer using the "
+        "memory above where relevant; otherwise blank>\n\n"
+        "MODE READ = the user wants to read/see text in front of them "
+        "('read this', 'what does this say', 'read the page').\n"
+        "MODE CONTROL = commanding the device itself: STOP (stop/quiet/cancel), "
+        "REPEAT (say again), FORGET (clear memory), LOUDER, SOFTER.\n"
+        "MODE ASK = a general question for information."
+    )
+    reply = gemini([prompt, audio_part])
+
+    mode, command, heard, answer = "ASK", "", "", ""
+    for line in reply.splitlines():
+        u = line.upper()
+        if u.startswith("MODE:"):
+            mode = "READ" if "READ" in u else ("CONTROL" if "CONTROL" in u else "ASK")
+        elif u.startswith("COMMAND:"):
+            command = line.split(":", 1)[1].strip().upper()
+        elif u.startswith("HEARD:"):
+            heard = line.split(":", 1)[1].strip()
+        elif u.startswith("ANSWER:"):
+            answer = line.split(":", 1)[1].strip()
+
+    # Local backup for control phrases.
+    low = heard.lower()
+    for cmd, phrases in CONTROL_MAP:
+        if any(p in low for p in phrases):
+            mode, command = "CONTROL", cmd
+            break
+    return mode, command, heard, answer
+
+
+def handle_brain_control(command):
+    """Run a CONTROL command; returns the text to speak."""
+    global _brain_volume_idx
+    if command == "STOP":
+        return "Okay, stopping."
+    if command == "REPEAT":
+        return _brain_last_answer or "I have nothing to repeat yet."
+    if command == "FORGET":
+        _brain_mem["summary"] = ""
+        _brain_mem["history"] = []
+        memory.save_mem(_brain_mem)
+        return "I have cleared my memory."
+    if command == "LOUDER":
+        _brain_volume_idx = min(_brain_volume_idx + 1, len(BRAIN_VOLUME_STEPS) - 1)
+        return "Okay, speaking louder."
+    if command == "SOFTER":
+        _brain_volume_idx = max(_brain_volume_idx - 1, 0)
+        return "Okay, speaking softer."
+    return "Sorry, I did not understand that command."
+
+
+def speak_local(text, voice="Aria"):
+    """Speak on THIS laptop via edge-tts at the current volume level."""
+    tts_voice = VOICE_MAP.get(voice, DEFAULT_VOICE)
+    vol = BRAIN_VOLUME_STEPS[_brain_volume_idx]
+    async def _gen():
+        c = edge_tts.Communicate(text, tts_voice, volume=vol)
+        await c.save("reply.mp3")
+    asyncio.run(_gen())
+    try:
+        playsound("reply.mp3")
+    except Exception as e:
+        print("  (play error:", e, ")")
 
 
 @app.route("/brain", methods=["POST"])
 def brain():
+    global _brain_last_answer
     if "audio" in request.files:
         audio_bytes = request.files["audio"].read()
     else:
@@ -246,24 +344,32 @@ def brain():
     if not audio_bytes:
         return Response("No audio received", status=400)
 
-    # Hand the audio to combined_spes' classifier (it reads QUESTION_WAV).
-    with open(cspes.QUESTION_WAV, "wb") as f:
-        f.write(audio_bytes)
+    context = memory.build_context(_brain_mem)
     try:
-        mode, heard, answer = cspes.classify_and_answer()
+        mode, command, heard, answer = classify_brain(audio_bytes, context)
     except Exception as e:
         print("[/brain] classify error:", e)
         return Response("error", status=500)
+    print("[/brain] heard:", heard, "| mode:", mode, command)
 
-    print("[/brain] heard:", heard, "| mode:", mode)
-    if mode == "READ":
-        text = cspes.read_camera_image()      # pulls from ESP32-CAM + OCR
+    if mode == "CONTROL":
+        spoken = handle_brain_control(command)
+        speak_local(spoken)
+        # control acks aren't stored as conversation turns
+
+    elif mode == "READ":
+        text = cspes.read_camera_image()          # pulls from ESP32-CAM + OCR
         spoken = "Here is what I can read. " + text
-    else:
-        spoken = answer or NO_SPEECH_MSG
+        speak_local(spoken)
+        _brain_last_answer = spoken
+        memory.remember_turn(_brain_mem, heard or "read this",
+                             "Read aloud: " + text, client, MODELS)
 
-    print("[/brain] speaking:", spoken[:80])
-    cspes.speak(spoken)                        # plays on the LAPTOP
+    else:  # ASK
+        spoken = answer or NO_SPEECH_MSG
+        speak_local(spoken)
+        _brain_last_answer = spoken
+        memory.remember_turn(_brain_mem, heard, spoken, client, MODELS)
 
     resp = Response("OK", status=200)
     resp.headers["X-SPES-Text"] = urllib.parse.quote(spoken)
