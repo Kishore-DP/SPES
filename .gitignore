@@ -15,3 +15,7 @@ question.wav
 reply.mp3
 *.log
 server_log.txt
+
+# Companion app user data (todos, contacts, settings) + saved photos
+app_data/
+pictures/

@@ -9,9 +9,12 @@
 # It listens on all network interfaces at port 5000.
 
 import asyncio
+import glob
+import json
+import os
 import time
 import urllib.parse
-from flask import Flask, request, send_file, Response
+from flask import Flask, request, send_file, send_from_directory, jsonify, Response
 from google import genai
 from google.genai import types
 import edge_tts
@@ -344,8 +347,11 @@ def handle_brain_control(command):
     return "Sorry, I did not understand that command."
 
 
-def speak_local(text, voice="Aria"):
-    """Speak on THIS laptop via edge-tts at the current volume level."""
+def speak_local(text, voice=None):
+    """Speak on THIS laptop via edge-tts at the current volume level, using the
+    voice chosen in the app's settings unless one is passed explicitly."""
+    if voice is None:
+        voice = get_settings().get("voice", "Aria")
     tts_voice = VOICE_MAP.get(voice, DEFAULT_VOICE)
     vol = BRAIN_VOLUME_STEPS[_brain_volume_idx]
     async def _gen():
@@ -400,12 +406,21 @@ def brain():
                 photo = requests.get(cspes.ESP32_CAM_URL, timeout=10).content
         except Exception as e:
             print("[/brain] SOS photo error:", e)
+        if photo:
+            try:
+                save_picture(photo)
+            except Exception:
+                pass
         spoken, _maps = sos.send_sos(photo)
         speak_local(spoken)
         # SOS is not stored as a normal conversation turn
 
     elif mode == "READ":
         text = cspes.read_camera_image()          # pulls from ESP32-CAM + OCR
+        try:                                      # keep the photo in the gallery
+            save_picture(open(cspes.CAMERA_IMAGE, "rb").read())
+        except Exception:
+            pass
         spoken = "Here is what I can read. " + text
         speak_local(spoken)
         _brain_last_answer = spoken
@@ -421,6 +436,203 @@ def brain():
     resp = Response("OK", status=200)
     resp.headers["X-SPES-Text"] = urllib.parse.quote(spoken)
     return resp
+
+
+# ====================================================================
+#  SPES COMPANION APP API  (the phone app talks to these)
+# ====================================================================
+APP_DIR = "app_data"
+PICS_DIR = "pictures"
+os.makedirs(APP_DIR, exist_ok=True)
+os.makedirs(PICS_DIR, exist_ok=True)
+MAX_PICTURES = 10
+
+
+def _load(name, default):
+    p = os.path.join(APP_DIR, name)
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return default
+
+
+def _save(name, data):
+    with open(os.path.join(APP_DIR, name), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def save_picture(img_bytes):
+    """Save a camera photo and keep only the newest MAX_PICTURES."""
+    fname = time.strftime("%Y%m%d-%H%M%S") + ".jpg"
+    with open(os.path.join(PICS_DIR, fname), "wb") as f:
+        f.write(img_bytes)
+    pics = sorted(glob.glob(os.path.join(PICS_DIR, "*.jpg")))
+    for old in pics[:-MAX_PICTURES]:      # delete all but the newest 10
+        try:
+            os.remove(old)
+        except Exception:
+            pass
+
+
+def get_settings():
+    return _load("settings.json", {"voice": "Aria", "wakeWord": "Max"})
+
+
+# ---------- To-do list ----------
+@app.route("/api/todos", methods=["GET"])
+def todos_get():
+    return jsonify(_load("todos.json", []))
+
+
+@app.route("/api/todos", methods=["POST"])
+def todos_add():
+    text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
+    if not text:
+        return Response("empty", status=400)
+    todos = _load("todos.json", [])
+    todos.append({"id": int(time.time() * 1000), "text": text, "done": False})
+    _save("todos.json", todos)
+    return jsonify(todos)
+
+
+@app.route("/api/todos/<int:tid>", methods=["PATCH"])
+def todos_toggle(tid):
+    todos = _load("todos.json", [])
+    for t in todos:
+        if t["id"] == tid:
+            t["done"] = not t["done"]
+    _save("todos.json", todos)
+    return jsonify(todos)
+
+
+@app.route("/api/todos/<int:tid>", methods=["DELETE"])
+def todos_del(tid):
+    todos = [t for t in _load("todos.json", []) if t["id"] != tid]
+    _save("todos.json", todos)
+    return jsonify(todos)
+
+
+# ---------- SOS contacts (guardians) ----------
+@app.route("/api/contacts", methods=["GET"])
+def contacts_get():
+    return jsonify(_load("contacts.json", []))
+
+
+@app.route("/api/contacts", methods=["POST"])
+def contacts_add():
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    if not name or not phone:
+        return Response("name and phone required", status=400)
+    contacts = _load("contacts.json", [])
+    contacts.append({"id": int(time.time() * 1000), "name": name, "phone": phone})
+    _save("contacts.json", contacts)
+    return jsonify(contacts)
+
+
+@app.route("/api/contacts/<int:cid>", methods=["DELETE"])
+def contacts_del(cid):
+    contacts = [c for c in _load("contacts.json", []) if c["id"] != cid]
+    _save("contacts.json", contacts)
+    return jsonify(contacts)
+
+
+# ---------- AI assistant settings (voice + wake word) ----------
+@app.route("/api/settings", methods=["GET"])
+def settings_get():
+    return jsonify(get_settings())
+
+
+@app.route("/api/settings", methods=["POST"])
+def settings_set():
+    body = request.get_json(silent=True) or {}
+    s = get_settings()
+    if "voice" in body:
+        s["voice"] = body["voice"]
+    if "wakeWord" in body:
+        s["wakeWord"] = body["wakeWord"]
+    _save("settings.json", s)
+    return jsonify(s)
+
+
+@app.route("/api/voices", methods=["GET"])
+def voices_get():
+    return jsonify(list(VOICE_MAP.keys()))
+
+
+# ---------- Pictures (recent 10 from the AI cam) ----------
+@app.route("/api/pictures", methods=["GET"])
+def pictures_list():
+    pics = sorted(glob.glob(os.path.join(PICS_DIR, "*.jpg")), reverse=True)[:MAX_PICTURES]
+    out = []
+    for p in pics:
+        name = os.path.basename(p)
+        out.append({"name": name,
+                    "time": os.path.getmtime(p),
+                    "url": "/pictures/" + name})
+    return jsonify(out)
+
+
+@app.route("/api/pictures/capture", methods=["POST"])
+def pictures_capture():
+    """Grab a fresh photo from the ESP32-CAM right now and store it."""
+    try:
+        img = requests.get(cspes.ESP32_CAM_URL, timeout=10).content
+        save_picture(img)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+@app.route("/pictures/<name>")
+def pictures_serve(name):
+    return send_from_directory(PICS_DIR, name)
+
+
+# ---------- Location + beep ----------
+@app.route("/api/location", methods=["GET"])
+def location_get():
+    loc = nav.current_location()
+    if not loc:
+        return jsonify({"ok": False})
+    lat, lon, city = loc
+    return jsonify({"ok": True, "lat": lat, "lon": lon, "city": city,
+                    "maps": f"https://maps.google.com/?q={lat},{lon}"})
+
+
+@app.route("/api/sos", methods=["POST"])
+def api_sos():
+    """Trigger an SOS from the app (captures a photo + alerts the guardian)."""
+    photo = None
+    try:
+        photo = requests.get(cspes.ESP32_CAM_URL, timeout=10).content
+        save_picture(photo)
+    except Exception as e:
+        print("[/api/sos] photo error:", e)
+    spoken, maps = sos.send_sos(photo)
+    return jsonify({"ok": True, "message": spoken, "maps": maps})
+
+
+@app.route("/api/beep", methods=["POST"])
+def beep():
+    """Ask the device to beep (find-my-SPES). Speaks a beep on the laptop for
+    now; later this signals the ESP32 buzzer/speaker."""
+    print("[/api/beep] BEEP requested")
+    try:
+        speak_local("Beep. Beep. Beep. I am here.")
+    except Exception as e:
+        print("  beep error:", e)
+    return jsonify({"ok": True})
+
+
+# ---------- serve the companion app (open http://<laptop-ip>:5000/app) ----------
+@app.route("/app")
+def companion_app():
+    return send_from_directory("app", "index.html")
 
 
 if __name__ == "__main__":
