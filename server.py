@@ -270,7 +270,7 @@ def classify_brain(audio_bytes, context=""):
         memblock +
         "The audio is a spoken command to SPES, a reading aid + assistant for a "
         "visually impaired user. Reply in EXACTLY this format, nothing else:\n"
-        "MODE: READ or ASK or CONTROL or NAVIGATE or SOS\n"
+        "MODE: READ or CAPTURE or ASK or CONTROL or NAVIGATE or SOS\n"
         "COMMAND: <if MODE is CONTROL, one of STOP, REPEAT, FORGET, LOUDER, "
         "SOFTER; otherwise blank>\n"
         "DESTINATION: <if MODE is NAVIGATE, the place the user wants to go to; "
@@ -278,8 +278,11 @@ def classify_brain(audio_bytes, context=""):
         "HEARD: <exactly what the user said>\n"
         "ANSWER: <if MODE is ASK, a brief 1-3 sentence spoken answer using the "
         "memory above where relevant; otherwise blank>\n\n"
-        "MODE READ = the user wants to read/see text in front of them "
+        "MODE READ = the user wants to read/see TEXT in front of them "
         "('read this', 'what does this say', 'read the page').\n"
+        "MODE CAPTURE = the user just wants to take/save a photo, with NO reading "
+        "('capture this', 'take a photo', 'take a picture', 'save this photo', "
+        "'capture this pic').\n"
         "MODE NAVIGATE = the user wants directions to a place ('navigate to', "
         "'take me to', 'directions to', 'how do I get to').\n"
         "MODE SOS = the user is in danger or needs emergency help ('SOS', "
@@ -294,7 +297,9 @@ def classify_brain(audio_bytes, context=""):
     for line in reply.splitlines():
         u = line.upper()
         if u.startswith("MODE:"):
-            if "READ" in u:
+            if "CAPTURE" in u:
+                mode = "CAPTURE"
+            elif "READ" in u:
                 mode = "READ"
             elif "NAVIGATE" in u:
                 mode = "NAVIGATE"
@@ -319,6 +324,10 @@ def classify_brain(audio_bytes, context=""):
         if any(p in low for p in phrases):
             mode, command = "CONTROL", cmd
             break
+    # Local backup for CAPTURE (save a photo, no reading).
+    if any(p in low for p in ["capture this", "take a photo", "take a picture",
+                              "save this photo", "capture this pic", "take this photo"]):
+        mode = "CAPTURE"
     # Local backup for SOS (safety: err toward triggering).
     if any(p in low for p in ["sos", "emergency", "help me",
                               "in danger", "call for help", "save me"]):
@@ -415,9 +424,20 @@ def brain():
         speak_local(spoken)
         # SOS is not stored as a normal conversation turn
 
+    elif mode == "CAPTURE":
+        # Just take a photo and keep it in the Saved gallery -- no reading.
+        try:
+            img = requests.get(cspes.ESP32_CAM_URL, timeout=10).content
+            save_picture_saved(img)
+            spoken = "Photo captured and saved."
+        except Exception as e:
+            print("[/brain] capture error:", e)
+            spoken = "Sorry, I could not reach the camera to take a photo."
+        speak_local(spoken)
+
     elif mode == "READ":
         text = cspes.read_camera_image()          # pulls from ESP32-CAM + OCR
-        try:                                      # keep the photo in the gallery
+        try:                                      # keep the photo in Recent
             save_picture(open(cspes.CAMERA_IMAGE, "rb").read())
         except Exception:
             pass
@@ -443,9 +463,11 @@ def brain():
 # ====================================================================
 APP_DIR = "app_data"
 PICS_DIR = "pictures"
-os.makedirs(APP_DIR, exist_ok=True)
-os.makedirs(PICS_DIR, exist_ok=True)
-MAX_PICTURES = 10
+RECENT_DIR = os.path.join(PICS_DIR, "recent")   # auto captures (reading/SOS), pruned
+SAVED_DIR = os.path.join(PICS_DIR, "saved")     # user "capture this" photos, kept
+for _d in (APP_DIR, RECENT_DIR, SAVED_DIR):
+    os.makedirs(_d, exist_ok=True)
+MAX_RECENT = 10
 
 
 def _load(name, default):
@@ -465,16 +487,32 @@ def _save(name, data):
 
 
 def save_picture(img_bytes):
-    """Save a camera photo and keep only the newest MAX_PICTURES."""
+    """Auto-save a photo to RECENT, keeping only the newest MAX_RECENT."""
     fname = time.strftime("%Y%m%d-%H%M%S") + ".jpg"
-    with open(os.path.join(PICS_DIR, fname), "wb") as f:
+    with open(os.path.join(RECENT_DIR, fname), "wb") as f:
         f.write(img_bytes)
-    pics = sorted(glob.glob(os.path.join(PICS_DIR, "*.jpg")))
-    for old in pics[:-MAX_PICTURES]:      # delete all but the newest 10
+    pics = sorted(glob.glob(os.path.join(RECENT_DIR, "*.jpg")))
+    for old in pics[:-MAX_RECENT]:        # delete all but the newest 10
         try:
             os.remove(old)
         except Exception:
             pass
+
+
+def save_picture_saved(img_bytes):
+    """Permanently save a photo the user asked to capture (Saved gallery)."""
+    fname = time.strftime("%Y%m%d-%H%M%S") + ".jpg"
+    with open(os.path.join(SAVED_DIR, fname), "wb") as f:
+        f.write(img_bytes)
+    return fname
+
+
+def _list_pics(folder, seg, limit=None):
+    pics = sorted(glob.glob(os.path.join(folder, "*.jpg")), reverse=True)
+    if limit:
+        pics = pics[:limit]
+    return [{"name": os.path.basename(p), "time": os.path.getmtime(p),
+             "url": f"/pictures/{seg}/{os.path.basename(p)}"} for p in pics]
 
 
 def get_settings():
@@ -564,33 +602,43 @@ def voices_get():
     return jsonify(list(VOICE_MAP.keys()))
 
 
-# ---------- Pictures (recent 10 from the AI cam) ----------
+# ---------- Pictures: Recent (auto, last 10) + Saved (user-captured) ----------
 @app.route("/api/pictures", methods=["GET"])
-def pictures_list():
-    pics = sorted(glob.glob(os.path.join(PICS_DIR, "*.jpg")), reverse=True)[:MAX_PICTURES]
-    out = []
-    for p in pics:
-        name = os.path.basename(p)
-        out.append({"name": name,
-                    "time": os.path.getmtime(p),
-                    "url": "/pictures/" + name})
-    return jsonify(out)
+def pictures_recent():
+    return jsonify(_list_pics(RECENT_DIR, "recent", MAX_RECENT))
+
+
+@app.route("/api/pictures/saved", methods=["GET"])
+def pictures_saved():
+    return jsonify(_list_pics(SAVED_DIR, "saved"))
 
 
 @app.route("/api/pictures/capture", methods=["POST"])
 def pictures_capture():
-    """Grab a fresh photo from the ESP32-CAM right now and store it."""
+    """Grab a fresh photo from the ESP32-CAM and keep it in the Saved gallery
+    (an explicit capture by the user)."""
     try:
         img = requests.get(cspes.ESP32_CAM_URL, timeout=10).content
-        save_picture(img)
-        return jsonify({"ok": True})
+        name = save_picture_saved(img)
+        return jsonify({"ok": True, "name": name})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
 
 
-@app.route("/pictures/<name>")
-def pictures_serve(name):
-    return send_from_directory(PICS_DIR, name)
+@app.route("/api/pictures/saved/<name>", methods=["DELETE"])
+def pictures_saved_del(name):
+    try:
+        os.remove(os.path.join(SAVED_DIR, os.path.basename(name)))
+    except Exception:
+        pass
+    return jsonify(_list_pics(SAVED_DIR, "saved"))
+
+
+@app.route("/pictures/<folder>/<name>")
+def pictures_serve(folder, name):
+    if folder not in ("recent", "saved"):
+        return Response("not found", status=404)
+    return send_from_directory(os.path.join(PICS_DIR, folder), name)
 
 
 # ---------- Location + beep ----------

@@ -57,6 +57,14 @@
   .pic img{width:100%;height:120px;object-fit:cover;display:block}
   .pic .ts{position:absolute;bottom:0;left:0;right:0;font-size:11px;padding:4px 8px;
     background:linear-gradient(transparent,rgba(0,0,0,.8));color:#fff}
+  .pic .del{position:absolute;top:6px;right:6px;background:rgba(0,0,0,.6);border:none;
+    color:#fff;width:26px;height:26px;border-radius:50%;font-size:16px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;line-height:1}
+  .subtabs{display:flex;gap:8px;margin-bottom:12px}
+  .subtab{flex:1;background:var(--card2);border:1px solid var(--line);color:var(--mut);
+    border-radius:12px;padding:10px;font-size:14px;font-weight:600;cursor:pointer}
+  .subtab.active{background:linear-gradient(90deg,var(--vio),var(--cyan));
+    color:#fff;border-color:transparent}
   .sosbtn{background:radial-gradient(circle at 50% 30%,#ff5e6e,#d61f3a);
     border:none;color:#fff;border-radius:20px;padding:26px;font-size:22px;font-weight:800;
     width:100%;letter-spacing:.1em;box-shadow:0 8px 30px rgba(255,45,80,.35);cursor:pointer}
@@ -146,9 +154,14 @@
 
   <!-- 5. PICTURES -->
   <section class="sec" id="pics">
-    <h2>Pictures &middot; recent 10</h2>
+    <h2>Pictures</h2>
+    <div class="subtabs">
+      <button class="subtab active" data-p="recent">Recent</button>
+      <button class="subtab" data-p="saved">Saved</button>
+    </div>
     <div class="card">
-      <button class="btn" id="capBtn">Capture now</button>
+      <button class="btn" id="capBtn">&#128247; Capture &amp; save</button>
+      <p class="mut" id="picNote" style="margin:10px 0 0"></p>
     </div>
     <div id="picGrid" class="grid"></div>
   </section>
@@ -272,22 +285,42 @@ $('#saveSettings').onclick=async()=>{
   toast('Settings saved');
 };
 
-// ---- 5. PICTURES ----
+// ---- 5. PICTURES (Recent auto / Saved by command) ----
+let picTab='recent';
+document.querySelectorAll('.subtab').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.subtab').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); picTab=b.dataset.p; loadPics();
+});
+function setPicTab(name){
+  picTab=name;
+  document.querySelectorAll('.subtab').forEach(x=>x.classList.toggle('active',x.dataset.p===name));
+}
 async function loadPics(){
-  const pics=await api('/api/pictures'); const g=$('#picGrid');
+  const g=$('#picGrid');
+  const path = picTab==='saved' ? '/api/pictures/saved' : '/api/pictures';
+  $('#picNote').textContent = picTab==='saved'
+    ? 'Photos you captured with "capture this". Kept until you delete them.'
+    : 'Auto-saved while reading. Only the newest 10 are kept.';
+  let pics=[];
+  try{ pics=await api(path); }catch(e){}
   if(!pics.length){ g.innerHTML='<div class="empty" style="grid-column:1/3">No pictures yet</div>'; return; }
   g.innerHTML='';
   pics.forEach(p=>{
     const d=document.createElement('div'); d.className='pic';
     const t=new Date(p.time*1000).toLocaleString();
-    d.innerHTML=`<img src="${API+p.url}" loading="lazy"><div class="ts">${t}</div>`;
+    const del = picTab==='saved' ? '<button class="del">&times;</button>' : '';
+    d.innerHTML=`<img src="${API+p.url}" loading="lazy">${del}<div class="ts">${t}</div>`;
+    if(picTab==='saved') d.querySelector('.del').onclick=async()=>{
+      await api('/api/pictures/saved/'+encodeURIComponent(p.name),{method:'DELETE'}); loadPics();
+    };
     g.appendChild(d);
   });
 }
 $('#capBtn').onclick=async()=>{
   toast('Capturing...');
   try{ const r=await api('/api/pictures/capture',{method:'POST',body:'{}'});
-    if(r.ok){ toast('Photo captured'); loadPics(); } else toast('Camera not reachable'); }
+    if(r.ok){ toast('Photo saved'); setPicTab('saved'); loadPics(); }
+    else toast('Camera not reachable'); }
   catch(e){ toast('Camera not reachable'); }
 };
 
