@@ -19,3 +19,8 @@ server_log.txt
 # Companion app user data (todos, contacts, settings) + saved photos
 app_data/
 pictures/
+
+# test artifacts
+test.wav
+tmp.mp3
+t.mp3
