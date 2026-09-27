@@ -24,7 +24,7 @@ logging.getLogger("google_genai").setLevel(logging.ERROR)
 logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 
 # --- Settings ---
-RECORD_SECONDS = 5
+RECORD_SECONDS = 4
 SAMPLE_RATE = 16000
 QUESTION_WAV = "question.wav"
 SILENCE_THRESHOLD = 60

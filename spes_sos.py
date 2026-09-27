@@ -13,18 +13,21 @@
 # Real deployment should route through a verified emergency service or a
 # registered guardian, never straight into a police system.
 
+import os
 import requests
 import spes_navigation as nav
 
 NTFY = "https://ntfy.sh"
-# CHANGE THIS to your own private topic and have your guardian subscribe to it.
-GUARDIAN_TOPIC = "spes-guardian-kishore-CHANGE-ME"
+# Set the GUARDIAN_TOPIC env var (on Render) to your own private topic and have
+# your guardian subscribe to it in the ntfy app. Falls back to a placeholder.
+GUARDIAN_TOPIC = os.environ.get("GUARDIAN_TOPIC", "spes-guardian-kishore-CHANGE-ME")
 
 
-def send_sos(photo_bytes=None):
+def send_sos(photo_bytes=None, location=None):
     """Push an SOS alert (location + optional photo) to the guardian's ntfy
-    topic. Returns (spoken_confirmation, maps_link)."""
-    loc = nav.current_location()
+    topic. `location` = (lat, lon, city); if None, falls back to IP geolocation.
+    Returns (spoken_confirmation, maps_link)."""
+    loc = location or nav.current_location()
     if loc:
         lat, lon, city = loc
         maps = f"https://maps.google.com/?q={lat},{lon}"

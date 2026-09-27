@@ -325,7 +325,17 @@ $('#capBtn').onclick=async()=>{
 };
 
 // ---- 6. LOCATION ----
+// Report the phone's real GPS to the backend so NAVIGATE/SOS use YOUR location
+// (the cloud server's own IP location would be wrong).
+function reportLocation(){
+  if(!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(async pos=>{
+    try{ await api('/api/location',{method:'POST',
+      body:JSON.stringify({lat:pos.coords.latitude, lon:pos.coords.longitude})}); }catch(e){}
+  }, ()=>{}, {enableHighAccuracy:true, timeout:8000});
+}
 async function loadLoc(){
+  reportLocation();
   const c=$('#locCard'); c.innerHTML='<p class="mut">Loading location...</p>';
   try{
     const l=await api('/api/location');
@@ -347,7 +357,7 @@ function esc(s){ return (s||'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>
 // ---- boot ----
 (async()=>{
   try{ renderTodos(await api('/api/todos')); renderContacts(await api('/api/contacts'));
-    await loadSettings(); }
+    await loadSettings(); reportLocation(); }
   catch(e){ dot.classList.remove('on'); toast('Cannot reach SPES server'); }
 })();
 </script>

@@ -10,6 +10,7 @@
 
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <ESPmDNS.h>
 
 #include "board_config.h"
 
@@ -90,11 +91,17 @@ void setup() {
   }
   Serial.println("\nWiFi connected");
 
+  // Advertise as spescam.local so the brain finds it by name (hotspot IPs change)
+  if (MDNS.begin("spescam")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS started: http://spescam.local");
+  }
+
   startCameraServer();
 
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
+  Serial.println("' (or http://spescam.local) to connect");
 }
 
 void loop() {

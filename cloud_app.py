@@ -34,6 +34,10 @@ if not API_KEY and os.path.exists("key.txt"):
     API_KEY = open("key.txt").read().strip()
 client = genai.Client(api_key=API_KEY)
 
+# Optional shared secret: if SPES_TOKEN env var is set, /brain requires the
+# header  X-SPES-Token: <that value>  (so randoms can't burn your Gemini quota).
+SPES_TOKEN = os.environ.get("SPES_TOKEN")
+
 MODELS = [
     "gemini-flash-lite-latest",
     "gemini-flash-latest",
@@ -147,6 +151,16 @@ def get_settings():
 # ---------------- brain state ----------------
 _mem = memory.load_mem()
 _last_answer = ""
+# The phone app pushes the user's real GPS here (POST /api/location). Nav/SOS
+# use it, because ip-api geolocation from Render would return the SERVER's
+# location, not the user's. None until the phone reports.
+_device_location = None   # (lat, lon, city)
+
+
+def device_location():
+    """User's location: the phone's reported GPS if available, else ip-api
+    (which on the cloud is only a rough fallback = server location)."""
+    return _device_location or nav.current_location()
 VOLUME_STEPS = ["-50%", "-25%", "+0%", "+25%", "+50%", "+100%"]
 _vol = 2
 
@@ -227,6 +241,8 @@ def brain():
     grabbed from the CAM). Returns the spoken reply as 16kHz mono PCM, with the
     text in the X-SPES-Text header."""
     global _last_answer
+    if SPES_TOKEN and request.headers.get("X-SPES-Token") != SPES_TOKEN:
+        return Response("unauthorized", status=401)
     audio_bytes = request.files["audio"].read() if "audio" in request.files else request.data
     image_bytes = request.files["image"].read() if "image" in request.files else None
     if not audio_bytes:
@@ -244,14 +260,14 @@ def brain():
         spoken = handle_control(command)
     elif mode == "NAVIGATE":
         try:
-            spoken = nav.navigate(dest)
+            spoken = nav.navigate(dest, origin=device_location())
         except Exception:
             spoken = "Sorry, navigation is not available right now."
         memory.remember_turn(_mem, heard or ("navigate to " + dest), "Gave directions to " + dest, client, MODELS)
     elif mode == "SOS":
         if image_bytes:
             save_picture(image_bytes, SAVED_DIR)
-        spoken, _ = sos.send_sos(image_bytes)
+        spoken, _ = sos.send_sos(image_bytes, location=device_location())
     elif mode == "CAPTURE":
         if image_bytes:
             save_picture(image_bytes, SAVED_DIR)
@@ -384,12 +400,26 @@ def pictures_serve(folder, name):
 
 @app.route("/api/location", methods=["GET"])
 def location_get():
-    loc = nav.current_location()
+    loc = device_location()
     if not loc:
         return jsonify({"ok": False})
     lat, lon, city = loc
     return jsonify({"ok": True, "lat": lat, "lon": lon, "city": city,
-                    "maps": f"https://maps.google.com/?q={lat},{lon}"})
+                    "maps": f"https://maps.google.com/?q={lat},{lon}",
+                    "source": "phone" if _device_location else "ip"})
+
+
+@app.route("/api/location", methods=["POST"])
+def location_set():
+    """The phone app posts the browser's real GPS here so NAVIGATE/SOS use the
+    user's location, not the cloud server's."""
+    global _device_location
+    b = request.get_json(silent=True) or {}
+    try:
+        _device_location = (float(b["lat"]), float(b["lon"]), b.get("city", "your location"))
+        return jsonify({"ok": True})
+    except Exception:
+        return jsonify({"ok": False, "error": "need lat and lon"}), 400
 
 
 @app.route("/api/health")
