@@ -136,6 +136,15 @@ Target reply time ~3s (realistic 4–8s with free cloud + cold starts).
 6. **Permanent storage** — a DB so todos/pictures survive Render restarts.
 7. **Final assembly** — battery + buck + boards + speaker glued onto the glasses.
 
+## 7b. Exact API + config → see `API.md` in the repo
+`API.md` documents the `/brain` contract (multipart fields `audio` [WAV 16k/16-bit/mono]
++ optional `image` [JPEG]; response = raw 16k mono PCM + `X-SPES-Text` header; optional
+`X-SPES-Token` auth), all endpoints, Render env vars (`GEMINI_KEY`, `GUARDIAN_TOPIC`,
+`SPES_TOKEN`), hardcoded IPs/SSIDs, the pin map (mic 25/33/32; amp RESERVED 26/27/22;
+touch RESERVED GPIO4), and how location is sourced. The new `firmware/esp32wroom_brain.ino`
+is the cloud version (photo + mic → HTTPS multipart → prints reply). CAM uses mDNS
+`spescam.local`. Location bug fixed: the phone app POSTs real GPS to `/api/location`.
+
 ## 8. Working URLs / refs
 - Cloud backend + website: **https://spes-kbho.onrender.com** (`/app`, `/brain`, `/api/*`).
 - Repo: `github.com/Kishore-DP/SPES` (private).
