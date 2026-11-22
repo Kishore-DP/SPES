@@ -33,6 +33,7 @@ API_KEY = os.environ.get("GEMINI_KEY")
 if not API_KEY and os.path.exists("key.txt"):
     API_KEY = open("key.txt").read().strip()
 client = genai.Client(api_key=API_KEY)
+print("[startup] Gemini key present:", bool(API_KEY), "| length:", len(API_KEY or ""))
 
 # Optional shared secret: if SPES_TOKEN env var is set, /brain requires the
 # header  X-SPES-Token: <that value>  (so randoms can't burn your Gemini quota).
@@ -58,17 +59,22 @@ def add_cors(resp):
 
 
 def gemini(contents):
+    last = None
     for model in MODELS:
-        for _ in range(3):
+        for attempt in range(3):
             try:
-                return client.models.generate_content(model=model, contents=contents).text.strip()
+                resp = client.models.generate_content(model=model, contents=contents)
+                return (resp.text or "").strip()
             except Exception as e:
+                last = e
                 msg = str(e)
-                if "503" in msg or "UNAVAILABLE" in msg or "429" in msg:
+                # show the REAL reason in the Render logs
+                print(f"[gemini] {model} try {attempt + 1} failed: {msg[:300]}")
+                if "503" in msg or "UNAVAILABLE" in msg or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                     time.sleep(2)
                     continue
                 break
-    raise RuntimeError("All models busy")
+    raise RuntimeError("All models failed: " + str(last)[:200])
 
 
 VOICE_MAP = {
@@ -81,11 +87,17 @@ PCM_RATE = 16000   # what the ESP32 plays (mono); it upsamples to the amp rate
 
 
 def text_to_pcm(text, voice="Aria"):
-    """TTS the text and return raw 16kHz mono 16-bit PCM (for the ESP32 speaker)."""
+    """TTS the text and return raw 16kHz mono 16-bit PCM (for the ESP32 speaker).
+    Tries edge-tts first; if Microsoft refuses (403), falls back to gTTS."""
     tts_voice = VOICE_MAP.get(voice, DEFAULT_VOICE)
-    async def _gen():
-        await edge_tts.Communicate(text, tts_voice).save("reply.mp3")
-    asyncio.run(_gen())
+    try:
+        async def _gen():
+            await edge_tts.Communicate(text, tts_voice).save("reply.mp3")
+        asyncio.run(_gen())
+    except Exception as e:
+        print("[tts] edge-tts failed:", str(e)[:200], "- using gTTS instead")
+        from gtts import gTTS
+        gTTS(text=text, lang="en", tld="co.in").save("reply.mp3")
     data = open("reply.mp3", "rb").read()
     dec = miniaudio.decode(data, output_format=miniaudio.SampleFormat.SIGNED16,
                            nchannels=1, sample_rate=PCM_RATE)

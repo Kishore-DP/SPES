@@ -1,6 +1,7 @@
 flask
 google-genai
 edge-tts>=7.3.1
+gTTS
 miniaudio
 requests
 gunicorn
