@@ -39,10 +39,15 @@ print("[startup] Gemini key present:", bool(API_KEY), "| length:", len(API_KEY o
 # header  X-SPES-Token: <that value>  (so randoms can't burn your Gemini quota).
 SPES_TOKEN = os.environ.get("SPES_TOKEN")
 
-MODELS = [
-    "gemini-flash-lite-latest",
-    "gemini-flash-latest",
-    "gemini-2.0-flash",
+# Models are tried in this order. To change them later WITHOUT touching code, set a
+# Render env var  GEMINI_MODELS  to a comma-separated list, e.g.
+#   gemini-3.5-flash-lite,gemini-3.8-flash
+_env_models = [m.strip() for m in os.environ.get("GEMINI_MODELS", "").split(",") if m.strip()]
+MODELS = _env_models or [
+    "gemini-3.5-flash-lite",   # fast + cheap (stable)
+    "gemini-3.8-flash",        # newest flash
+    "gemini-3.6-flash",        # stable flash
+    "gemini-3.1-flash-lite",   # stable lite
 ]
 NO_SPEECH_MSG = "Sorry, I could not catch that. Please try again."
 
