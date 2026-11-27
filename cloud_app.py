@@ -32,7 +32,7 @@ import spes_sos as sos
 API_KEY = os.environ.get("GEMINI_KEY")
 if not API_KEY and os.path.exists("key.txt"):
     API_KEY = open("key.txt").read().strip()
-client = genai.Client(api_key=API_KEY)
+client = genai.Client(api_key=API_KEY, http_options=types.HttpOptions(timeout=30000))
 print("[startup] Gemini key present:", bool(API_KEY), "| length:", len(API_KEY or ""))
 
 # Optional shared secret: if SPES_TOKEN env var is set, /brain requires the
@@ -97,7 +97,7 @@ def text_to_pcm(text, voice="Aria"):
     tts_voice = VOICE_MAP.get(voice, DEFAULT_VOICE)
     try:
         async def _gen():
-            await edge_tts.Communicate(text, tts_voice).save("reply.mp3")
+            await asyncio.wait_for(edge_tts.Communicate(text, tts_voice).save("reply.mp3"), timeout=20)
         asyncio.run(_gen())
     except Exception as e:
         print("[tts] edge-tts failed:", str(e)[:200], "- using gTTS instead")
@@ -204,7 +204,10 @@ def classify(audio_bytes, context=""):
         "READ = read text in front of them. CAPTURE = just take/save a photo, no "
         "reading. NAVIGATE = directions to a place. SOS = emergency/help. "
         "CONTROL = command the device (stop/repeat/forget/louder/softer). "
-        "ASK = a general question.")
+        "ASK = a general question. "
+        "IMPORTANT: if the audio is silent, noisy or you cannot clearly understand "
+        "words, use MODE: ASK, HEARD: unclear, ANSWER: Sorry, I did not catch that. "
+        "Never choose SOS unless the user clearly asks for help or says emergency.")
     reply = gemini([prompt, part])
     mode, command, dest, heard, answer = "ASK", "", "", "", ""
     for line in reply.splitlines():
@@ -231,8 +234,13 @@ def classify(audio_bytes, context=""):
             break
     if any(p in low for p in ["capture this", "take a photo", "take a picture", "save this photo"]):
         mode = "CAPTURE"
-    if any(p in low for p in ["sos", "emergency", "help me", "in danger", "call for help"]):
+    sos_words = ["sos", "emergency", "help me", "in danger", "call for help"]
+    if any(p in low for p in sos_words):
         mode = "SOS"
+    elif mode == "SOS":
+        mode, answer = "ASK", "Sorry, I did not catch that."   # model guessed SOS but no SOS words heard
+    if low.strip() in ("", "unclear") and mode == "ASK" and not answer:
+        answer = "Sorry, I did not catch that."
     return mode, command, dest, heard, answer
 
 
@@ -252,6 +260,19 @@ def handle_control(command):
     return "Sorry, I did not understand that command."
 
 
+LAST_AUDIO = b""
+
+
+@app.route("/debug/last.wav")
+def debug_last():
+    """Listen to the last recording the glasses sent. Needs ?token=<SPES_TOKEN> if one is set."""
+    if SPES_TOKEN and request.args.get("token") != SPES_TOKEN:
+        return "unauthorized", 401
+    if not LAST_AUDIO:
+        return "no recording yet", 404
+    return Response(LAST_AUDIO, mimetype="audio/wav")
+
+
 @app.route("/brain", methods=["POST"])
 def brain():
     """The ESP32 brain POSTs multipart: 'audio' (WAV) + optional 'image' (JPEG,
@@ -261,6 +282,8 @@ def brain():
     if SPES_TOKEN and request.headers.get("X-SPES-Token") != SPES_TOKEN:
         return Response("unauthorized", status=401)
     audio_bytes = request.files["audio"].read() if "audio" in request.files else request.data
+    global LAST_AUDIO
+    LAST_AUDIO = audio_bytes
     image_bytes = request.files["image"].read() if "image" in request.files else None
     if not audio_bytes:
         return Response("No audio", status=400)
